@@ -4,6 +4,8 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
+#define BUTTON 0  
+
 // Motor A pins
 #define ENA  1   
 #define IN1  3
@@ -13,9 +15,7 @@ TFT_eSPI tft = TFT_eSPI();
 #define ENB  11  
 #define IN3  10
 #define IN4  12
-
-#define BUTTON 0   
-
+ 
 // Ultrasonic pins
 #define TRIG_PIN 43
 #define ECHO_PIN 44
@@ -41,12 +41,12 @@ void setup() {
   Serial.begin(115200);
 
   // Init TFT
-  tft.setRotation(1);          // Landscape mode
-  tft.fillScreen(TFT_BLACK);   // Clear screen
+  tft.init();
+  tft.setRotation(1);          
+  tft.fillScreen(TFT_BLACK);   
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.setTextSize(2);
-  tft.drawString("Motor + Ultrasonic", 10, 10);
-
+  tft.drawString("ELEC3020 Team 49", 10, 10);
 
   // Motor pins
   pinMode(IN1, OUTPUT);
@@ -68,7 +68,6 @@ void setup() {
   ledcSetup(pwmChannelB, pwmFreq, pwmResolution);
   ledcAttachPin(ENB, pwmChannelB);
 
-  // Start forward at ~70% speed
   setMotors(true, 180);
 
   Serial.println("Dual motor control + Ultrasonic started");
