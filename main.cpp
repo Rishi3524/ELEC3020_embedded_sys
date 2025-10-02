@@ -1,35 +1,52 @@
 #include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
 
-// -------- Motor A pins --------
-#define ENA  1    // PWM pin (Motor A enable)
+TFT_eSPI tft = TFT_eSPI();
+
+// Motor A pins
+#define ENA  1   
 #define IN1  3
 #define IN2  2
 
-// -------- Motor B pins --------
-#define ENB  11  // PWM pin (Motor B enable)
+// Motor B pins
+#define ENB  11  
 #define IN3  10
 #define IN4  12
 
-// -------- Button --------
-#define BUTTON 0   // Built-in button on ESP32 T-Display S3
+#define BUTTON 0   
 
-// -------- Motor state --------
+// Ultrasonic pins
+#define TRIG_PIN 43
+#define ECHO_PIN 44
+
+// Motor state
 bool direction = true;   // true = forward, false = backward
 
-// -------- PWM setup --------
+// PWM setup
 const int pwmChannelA = 0;
 const int pwmChannelB = 1;
-const int pwmFreq = 5000;   // 5 kHz
-const int pwmResolution = 8; // 8-bit (0–255)
+const int pwmFreq = 5000;  
+const int pwmResolution = 8; 
 
-// -------- Debounce --------
+// Debounce
 unsigned long lastPress = 0;
 const unsigned long debounceDelay = 200;
 
+// Function prototypes
 void setMotors(bool forward, int speed);
+long readUltrasonic();
 
 void setup() {
   Serial.begin(115200);
+
+  // Init TFT
+  tft.setRotation(1);          // Landscape mode
+  tft.fillScreen(TFT_BLACK);   // Clear screen
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.drawString("Motor + Ultrasonic", 10, 10);
+
 
   // Motor pins
   pinMode(IN1, OUTPUT);
@@ -40,6 +57,10 @@ void setup() {
   // Button
   pinMode(BUTTON, INPUT_PULLUP);
 
+  // Ultrasonic pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
   // Setup PWM channels
   ledcSetup(pwmChannelA, pwmFreq, pwmResolution);
   ledcAttachPin(ENA, pwmChannelA);
@@ -47,9 +68,10 @@ void setup() {
   ledcSetup(pwmChannelB, pwmFreq, pwmResolution);
   ledcAttachPin(ENB, pwmChannelB);
 
+  // Start forward at ~70% speed
+  setMotors(true, 180);
 
-
-  Serial.println("Dual motor control started");
+  Serial.println("Dual motor control + Ultrasonic started");
 }
 
 void loop() {
@@ -58,16 +80,34 @@ void loop() {
   if (buttonState == LOW && (millis() - lastPress > debounceDelay)) {
     direction = !direction; // Toggle direction
 
-    setMotors(direction, 180); // Run at ~70% speed
+    setMotors(direction, 170); 
 
     Serial.print("Motors now: ");
     Serial.println(direction ? "Forward" : "Backward");
 
     lastPress = millis();
   }
+
+  long distance = readUltrasonic();
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+
+  // --- TFT output ---
+  tft.fillRect(0, 40, 240, 60, TFT_BLACK); // Clear old distance
+  tft.setCursor(10, 40);
+  tft.printf("Dist: %ld cm", distance);
+
+  tft.fillRect(0, 100, 240, 40, TFT_BLACK); // Clear old direction
+  tft.setCursor(10, 100);
+  tft.printf("Motors: %s", direction ? "Forward" : "Backward");
+  
+
+
+  delay(200);
 }
 
-// -------- Helper function --------
+// Motor control
 void setMotors(bool forward, int speed) {
   if (forward) {
     digitalWrite(IN1, HIGH);
@@ -82,6 +122,23 @@ void setMotors(bool forward, int speed) {
   }
 
   // Apply PWM speed
-  ledcWrite(pwmChannelA, speed); // 0–255
-  ledcWrite(pwmChannelB, speed); // 0–255
+  ledcWrite(pwmChannelA, speed); 
+  ledcWrite(pwmChannelB, speed);
+}
+
+// Ultrasonic sensor
+long readUltrasonic() {
+  // Trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Measure echo pulse length
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); 
+
+  // Convert to cm
+  long distance = duration * 0.034 / 2;
+  return distance;
 }
