@@ -21,13 +21,16 @@ TFT_eSPI tft = TFT_eSPI();
 #define TRIG_PIN 43
 #define ECHO_PIN 44
 
-// IR sensor pin (detects white line)
-#define IR_PIN 18    // <-- CHANGE if your IR sensor uses a different pin
+// IR sensor pin
+#define IR_PIN 18    
+
+// Opponent indicator LED
+#define LED_PIN 17    
 
 // ---------------- PWM Setup ----------------
 const int pwmChannelA = 0;
 const int pwmChannelB = 1;
-const int pwmFreq = 5000;  
+const int pwmFreq = 5000;
 const int pwmResolution = 8; // 0–255
 
 // ---------------- Behaviour Constants ----------------
@@ -35,14 +38,19 @@ const int ATTACK_SPEED = 255;        // speed when chasing
 const int REVERSE_SPEED = 220;       // speed when escaping line
 const int DIST_THRESHOLD_CM = 30;    // opponent detection threshold
 const int REVERSE_TIME_MS = 500;     // reverse duration when IR detects white
-const int RAMP_TIME_MS = 300;        // ramp up time for motors
+const int RAMP_TIME_MS = 300;        // (unused but kept)
+const int SEARCH_SPIN_SPEED = 180;   // speed while rotating to search
+const int RECOVER_TIME_MS = 600;     // time for recovery turn
+const int NO_DETECT_TIMEOUT_MS = 2500; // timeout before spinning search
 
 // ---------------- Variables ----------------
 int currentSpeed = 0;
-bool ramping = false;
-unsigned long rampStartMillis = 0;
-unsigned long reverseStartMillis = 0;
-bool reversing = false;
+unsigned long lastDetectTime = 0;
+unsigned long stateStartTime = 0;
+
+// ---------------- State Machine ----------------
+enum BotState { SEARCHING, ATTACKING, ESCAPING, RECOVERING };
+BotState state = SEARCHING;
 
 // ---------------- Function Prototypes ----------------
 long readUltrasonic();
@@ -50,8 +58,6 @@ bool detectWhiteLine();
 void setMotors(bool forward, int speed);
 void stopMotors();
 void updateDisplay(const char* status, long distance);
-void handleOpponentDetection(long distance);
-void handleLineEscape();
 
 // ------------------------------------------------------
 void setup() {
@@ -78,6 +84,10 @@ void setup() {
   // IR sensor setup
   pinMode(IR_PIN, INPUT);
 
+  // LED setup
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   // PWM setup
   ledcSetup(pwmChannelA, pwmFreq, pwmResolution);
   ledcAttachPin(ENA, pwmChannelA);
@@ -86,15 +96,16 @@ void setup() {
 
   stopMotors();
 
-    // Button (unused but kept for compatibility)
+  // Button
   pinMode(BUTTON, INPUT_PULLUP);
-
   tft.drawString("Press button to start", 10, 100);
+
   while (digitalRead(BUTTON) == HIGH) {
     delay(100);
   }
 
-  Serial.println("Sumo Bot Ready — UWA ELEC3020 Team 49");
+  Serial.println("Sumo Bot Ready — Battle Mode");
+  tft.fillScreen(TFT_BLACK);
   delay(300);
 }
 
@@ -102,51 +113,85 @@ void setup() {
 void loop() {
   long distance = readUltrasonic();
   bool whiteLine = detectWhiteLine();
+  unsigned long now = millis();
 
-  if (whiteLine && !reversing) {
-    // Start reverse sequence
-    reversing = true;
-    reverseStartMillis = millis();
+  // 1️. ESCAPE LINE 
+  if (whiteLine && state != ESCAPING) {
+    state = ESCAPING;
+    stateStartTime = now;
     setMotors(false, REVERSE_SPEED);
     updateDisplay("ESCAPING LINE", distance);
+    digitalWrite(LED_PIN, LOW);
     Serial.println("White line detected! Reversing...");
-  }
-
-  if (reversing) {
-    if (millis() - reverseStartMillis >= REVERSE_TIME_MS) {
-      reversing = false;
-      stopMotors();
-    }
-    delay(50);
     return;
   }
 
-  // Normal opponent detection
-  handleOpponentDetection(distance);
-  delay(100);
-}
-
-// ------------------------------------------------------
-void handleOpponentDetection(long distance) {
-  bool detected = (distance > 0 && distance <= DIST_THRESHOLD_CM);
-
-  if (detected) {
-    setMotors(true, ATTACK_SPEED);
-    updateDisplay("OPPONENT!", distance);
-  } else {
-    stopMotors();
-    updateDisplay("SEARCHING...", distance);
+  if (state == ESCAPING) {
+    if (now - stateStartTime >= REVERSE_TIME_MS) {
+      state = RECOVERING;
+      stateStartTime = now;
+      // Turn in place after reverse
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      digitalWrite(IN3, LOW);
+      digitalWrite(IN4, HIGH);
+      ledcWrite(pwmChannelA, SEARCH_SPIN_SPEED);
+      ledcWrite(pwmChannelB, SEARCH_SPIN_SPEED);
+      updateDisplay("RECOVERING...", distance);
+    }
+    return;
   }
+
+  // 2️. RECOVERY TURN
+  if (state == RECOVERING) {
+    if (now - stateStartTime >= RECOVER_TIME_MS) {
+      state = SEARCHING;
+      stopMotors();
+      updateDisplay("SEARCHING...", distance);
+    }
+    return;
+  }
+
+  // 3️. ATTACK & SEARCH LOGIC
+  bool opponentDetected = (distance > 0 && distance <= DIST_THRESHOLD_CM);
+
+  if (opponentDetected) {
+    lastDetectTime = now;
+    state = ATTACKING;
+
+    // Adaptive attack speed (faster when closer)
+    int speed = map(distance, 5, DIST_THRESHOLD_CM, 255, 150);
+    speed = constrain(speed, 150, 255);
+
+    setMotors(true, speed);
+    digitalWrite(LED_PIN, HIGH);
+    updateDisplay("ATTACKING!", distance);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+
+    if (now - lastDetectTime > NO_DETECT_TIMEOUT_MS) {
+      // Spin to search
+      state = SEARCHING;
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      digitalWrite(IN3, LOW);
+      digitalWrite(IN4, HIGH);
+      ledcWrite(pwmChannelA, SEARCH_SPIN_SPEED);
+      ledcWrite(pwmChannelB, SEARCH_SPIN_SPEED);
+      updateDisplay("SPIN SEARCH...", distance);
+    } else {
+      stopMotors();
+      updateDisplay("SEARCHING...", distance);
+    }
+  }
+
+  delay(100);
 }
 
 // ------------------------------------------------------
 void setMotors(bool forward, int speed) {
   speed = constrain(speed, 0, 255);
-
-  if (speed == 0) {
-    stopMotors();
-    return;
-  }
+  if (speed == 0) { stopMotors(); return; }
 
   if (forward) {
     digitalWrite(IN1, HIGH);
@@ -204,7 +249,6 @@ bool detectWhiteLine() {
 
   return lineDetected; // true = white line detected
 }
-
 
 // ------------------------------------------------------
 void updateDisplay(const char* status, long distance) {
