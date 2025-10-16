@@ -37,18 +37,18 @@ const int pwmResolution = 8; // 0–255
 // ---------------- Behaviour Constants ----------------
 const int ATTACK_SPEED = 255;           
 const int BACKUP_SPEED = 220;           
-const int DIST_THRESHOLD_CM = 40;       
-const unsigned long MAX_BLACK_DRIVE_MS = 250; // max time allowed on black
-const unsigned long BACKUP_TIME_MS = 300;    // reverse duration from black limit
-const int PIVOT_SPEED = 220;                  // speed for pivoting/searching
+const int DIST_THRESHOLD_CM = 80;       
+const unsigned long MAX_BLACK_DRIVE_MS = 0; // time allowed on black before reversing
+const unsigned long BACKUP_TIME_MS = 800;    // reverse duration from black limit
+const int PIVOT_SPEED = 220;                 // speed for pivot scanning
+const unsigned long FULL_SPIN_MS = 1500;     // time for full 360° clockwise spin
 
 // ---------------- Variables ----------------
 bool onBlack = false;
 unsigned long blackStartMillis = 0;
 bool backingUp = false;
 unsigned long backupStartMillis = 0;
-bool scanning = true;   // pivoting
-bool scanningDirection = true; // true = left, false = right
+bool scanning = true;
 
 // ---------------- Function Prototypes ----------------
 long readUltrasonic();
@@ -56,12 +56,12 @@ bool detectWhiteLine();
 void setMotors(bool forward, int speed);
 void stopMotors();
 void updateDisplay(const char* status, long distance);
-void handleOpponentDetection(long distance);
 void pivotScan();
+void reverseFromBlack();
+void attackOpponent();
 
 // ------------------------------------------------------
 void setup() {
-
   pinMode(LCD_POWER_ON, OUTPUT);
   digitalWrite(LCD_POWER_ON, HIGH); 
   pinMode(TFT_BL, OUTPUT);
@@ -69,7 +69,7 @@ void setup() {
 
   Serial.begin(115200);
 
-  // TFT Display setup
+  // TFT setup
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
@@ -113,91 +113,77 @@ void loop() {
   long distance = readUltrasonic();
   bool whiteLine = detectWhiteLine(); // true = white, false = black
 
-  // Handle black zone timing to avoid red
+  // If black detected, back up immediately
   if (!whiteLine && !backingUp) {
-    if (!onBlack) {
-      onBlack = true;
-      blackStartMillis = millis();
-    } else if (millis() - blackStartMillis >= MAX_BLACK_DRIVE_MS) {
-      backingUp = true;
-      backupStartMillis = millis();
-      setMotors(false, BACKUP_SPEED); 
-      updateDisplay("BLACK LIMIT", distance);
-    }
-  } else if (whiteLine) {
-    onBlack = false;
+    reverseFromBlack();
+    return;
   }
 
-  // Handle backing up after black limit
+  // If currently backing up, finish the sequence
   if (backingUp) {
     if (millis() - backupStartMillis >= BACKUP_TIME_MS) {
       backingUp = false;
       stopMotors();
     }
     delay(50);
-    return; // skip scanning/attacking while backing up
+    return;
   }
 
-  // Normal opponent detection
+  // Check for opponent
   bool opponentDetected = (distance > 0 && distance <= DIST_THRESHOLD_CM);
   if (opponentDetected) {
-    scanning = false;
-    setMotors(true, ATTACK_SPEED);
-    updateDisplay("OPPONENT!", distance);
+    attackOpponent();
   } else {
-    // Pivot scan when no opponent detected
-    scanning = true;
+    // Pivot scan clockwise full 360° when no opponent
+    pivotScan();
   }
 
-  if (scanning) pivotScan();
-
-  delay(100);
+  delay(50);
 }
 
 // ------------------------------------------------------
 void pivotScan() {
+  static unsigned long scanStart = 0;
+  static bool spinning = false;
 
-  // Stop any forward/backward ramping
-  stopMotors();
-
-  // Pivot in place to search for opponent
-  if (scanningDirection) {
-    // Left pivot
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
-  } else {
-    // Right pivot
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
+  if (!spinning) {
+    spinning = true;
+    scanStart = millis();
   }
+
+  // Pivot clockwise on the spot
+  digitalWrite(IN1, HIGH);  // Left wheel forward
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);   // Right wheel backward
+  digitalWrite(IN4, HIGH);
+
   ledcWrite(pwmChannelA, PIVOT_SPEED);
   ledcWrite(pwmChannelB, PIVOT_SPEED);
 
-  // Alternate direction every 1 second for sweeping
-  static unsigned long lastPivotMillis = 0;
-  if (millis() - lastPivotMillis > 1000) {
-    scanningDirection = !scanningDirection;
-    lastPivotMillis = millis();
-  }
-
   updateDisplay("SCANNING...", readUltrasonic());
+
+  // Stop after full spin duration
+  if (millis() - scanStart >= FULL_SPIN_MS) {
+    spinning = false;
+    stopMotors();
+  }
 }
 
 // ------------------------------------------------------
-void handleOpponentDetection(long distance) {
-  bool detected = (distance > 0 && distance <= DIST_THRESHOLD_CM);
+void attackOpponent() {
+  setMotors(true, ATTACK_SPEED);
+  updateDisplay("ATTACK!", readUltrasonic());
+  delay(300); // short charge
+  stopMotors();
+}
 
-  if (detected) {
-    setMotors(true, ATTACK_SPEED);
-    updateDisplay("OPPONENT!", distance);
-  } else {
-    stopMotors();
-    updateDisplay("SEARCHING...", distance);
-  }
+// ------------------------------------------------------
+void reverseFromBlack() {
+  backingUp = true;
+  backupStartMillis = millis();
+  setMotors(false, BACKUP_SPEED);
+  updateDisplay("EDGE AVOID!", readUltrasonic());
+  Serial.println("Black line detected — backing up!");
 }
 
 // ------------------------------------------------------
@@ -232,7 +218,6 @@ long readUltrasonic() {
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
   if (duration == 0) return -1;
   return (duration * 0.034 / 2);
@@ -240,16 +225,17 @@ long readUltrasonic() {
 
 // ------------------------------------------------------
 bool detectWhiteLine() {
-  bool lineDetected = digitalRead(IR_PIN); // HIGH = white, LOW = black
+  int irValue = analogRead(IR_PIN);
+  bool isWhite = (irValue > 1500); // calibrate as needed
 
-  // Display IR sensor value
+  // Display IR reading
   tft.fillRect(0, 120, 240, 30, TFT_BLACK);
   tft.setCursor(10, 120);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.printf("IR: %s", lineDetected ? "WHITE" : "BLACK");
+  tft.printf("IR: %d (%s)", irValue, isWhite ? "WHITE" : "BLACK");
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
-  return lineDetected;
+  return isWhite;
 }
 
 // ------------------------------------------------------
