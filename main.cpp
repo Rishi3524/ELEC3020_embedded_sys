@@ -13,16 +13,20 @@ TFT_eSPI tft = TFT_eSPI();
 #define IN2  2
 
 // Motor B pins
-#define ENB  11  
-#define IN3  10
-#define IN4  12
+#define ENB  43 
+#define IN3  18
+#define IN4  44
 
 // Ultrasonic pins
-#define TRIG_PIN 43
-#define ECHO_PIN 44
+#define TRIG_PIN 10
+#define ECHO_PIN 11
 
-// IR sensor pin (detects white line)
-#define IR_PIN 18    // <-- CHANGE if your IR sensor uses a different pin
+// IR sensor pin (detects white/black)
+#define IR_PIN 17
+
+// LCD power pins
+#define LCD_POWER_ON 15
+#define TFT_BL 38
 
 // ---------------- PWM Setup ----------------
 const int pwmChannelA = 0;
@@ -31,18 +35,20 @@ const int pwmFreq = 5000;
 const int pwmResolution = 8; // 0–255
 
 // ---------------- Behaviour Constants ----------------
-const int ATTACK_SPEED = 255;        // speed when chasing
-const int REVERSE_SPEED = 220;       // speed when escaping line
-const int DIST_THRESHOLD_CM = 30;    // opponent detection threshold
-const int REVERSE_TIME_MS = 500;     // reverse duration when IR detects white
-const int RAMP_TIME_MS = 300;        // ramp up time for motors
+const int ATTACK_SPEED = 255;           
+const int BACKUP_SPEED = 220;           
+const int DIST_THRESHOLD_CM = 40;       
+const unsigned long MAX_BLACK_DRIVE_MS = 250; // max time allowed on black
+const unsigned long BACKUP_TIME_MS = 300;    // reverse duration from black limit
+const int PIVOT_SPEED = 220;                  // speed for pivoting/searching
 
 // ---------------- Variables ----------------
-int currentSpeed = 0;
-bool ramping = false;
-unsigned long rampStartMillis = 0;
-unsigned long reverseStartMillis = 0;
-bool reversing = false;
+bool onBlack = false;
+unsigned long blackStartMillis = 0;
+bool backingUp = false;
+unsigned long backupStartMillis = 0;
+bool scanning = true;   // pivoting
+bool scanningDirection = true; // true = left, false = right
 
 // ---------------- Function Prototypes ----------------
 long readUltrasonic();
@@ -51,10 +57,16 @@ void setMotors(bool forward, int speed);
 void stopMotors();
 void updateDisplay(const char* status, long distance);
 void handleOpponentDetection(long distance);
-void handleLineEscape();
+void pivotScan();
 
 // ------------------------------------------------------
 void setup() {
+
+  pinMode(LCD_POWER_ON, OUTPUT);
+  digitalWrite(LCD_POWER_ON, HIGH); 
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);       
+
   Serial.begin(115200);
 
   // TFT Display setup
@@ -86,44 +98,93 @@ void setup() {
 
   stopMotors();
 
-    // Button (unused but kept for compatibility)
+  // Button start
   pinMode(BUTTON, INPUT_PULLUP);
-
   tft.drawString("Press button to start", 10, 100);
-  while (digitalRead(BUTTON) == HIGH) {
-    delay(100);
-  }
+  while (digitalRead(BUTTON) == HIGH) delay(100);
 
   Serial.println("Sumo Bot Ready — UWA ELEC3020 Team 49");
+  tft.fillScreen(TFT_BLACK);
   delay(300);
 }
 
 // ------------------------------------------------------
 void loop() {
   long distance = readUltrasonic();
-  bool whiteLine = detectWhiteLine();
+  bool whiteLine = detectWhiteLine(); // true = white, false = black
 
-  if (whiteLine && !reversing) {
-    // Start reverse sequence
-    reversing = true;
-    reverseStartMillis = millis();
-    setMotors(false, REVERSE_SPEED);
-    updateDisplay("ESCAPING LINE", distance);
-    Serial.println("White line detected! Reversing...");
+  // Handle black zone timing to avoid red
+  if (!whiteLine && !backingUp) {
+    if (!onBlack) {
+      onBlack = true;
+      blackStartMillis = millis();
+    } else if (millis() - blackStartMillis >= MAX_BLACK_DRIVE_MS) {
+      backingUp = true;
+      backupStartMillis = millis();
+      setMotors(false, BACKUP_SPEED); 
+      updateDisplay("BLACK LIMIT", distance);
+    }
+  } else if (whiteLine) {
+    onBlack = false;
   }
 
-  if (reversing) {
-    if (millis() - reverseStartMillis >= REVERSE_TIME_MS) {
-      reversing = false;
+  // Handle backing up after black limit
+  if (backingUp) {
+    if (millis() - backupStartMillis >= BACKUP_TIME_MS) {
+      backingUp = false;
       stopMotors();
     }
     delay(50);
-    return;
+    return; // skip scanning/attacking while backing up
   }
 
   // Normal opponent detection
-  handleOpponentDetection(distance);
+  bool opponentDetected = (distance > 0 && distance <= DIST_THRESHOLD_CM);
+  if (opponentDetected) {
+    scanning = false;
+    setMotors(true, ATTACK_SPEED);
+    updateDisplay("OPPONENT!", distance);
+  } else {
+    // Pivot scan when no opponent detected
+    scanning = true;
+  }
+
+  if (scanning) pivotScan();
+
   delay(100);
+}
+
+// ------------------------------------------------------
+void pivotScan() {
+
+  // Stop any forward/backward ramping
+  stopMotors();
+
+  // Pivot in place to search for opponent
+  if (scanningDirection) {
+    // Left pivot
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  } else {
+    // Right pivot
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  }
+  ledcWrite(pwmChannelA, PIVOT_SPEED);
+  ledcWrite(pwmChannelB, PIVOT_SPEED);
+
+  // Alternate direction every 1 second for sweeping
+  static unsigned long lastPivotMillis = 0;
+  if (millis() - lastPivotMillis > 1000) {
+    scanningDirection = !scanningDirection;
+    lastPivotMillis = millis();
+  }
+
+  updateDisplay("SCANNING...", readUltrasonic());
 }
 
 // ------------------------------------------------------
@@ -142,38 +203,26 @@ void handleOpponentDetection(long distance) {
 // ------------------------------------------------------
 void setMotors(bool forward, int speed) {
   speed = constrain(speed, 0, 255);
-
-  if (speed == 0) {
-    stopMotors();
-    return;
-  }
+  if (speed == 0) { stopMotors(); return; }
 
   if (forward) {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
   } else {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
   }
 
   ledcWrite(pwmChannelA, speed);
   ledcWrite(pwmChannelB, speed);
-  currentSpeed = speed;
 }
 
 // ------------------------------------------------------
 void stopMotors() {
   ledcWrite(pwmChannelA, 0);
   ledcWrite(pwmChannelB, 0);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  currentSpeed = 0;
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
 }
 
 // ------------------------------------------------------
@@ -193,18 +242,15 @@ long readUltrasonic() {
 bool detectWhiteLine() {
   bool lineDetected = digitalRead(IR_PIN); // HIGH = white, LOW = black
 
-  // Clear old reading area
+  // Display IR sensor value
   tft.fillRect(0, 120, 240, 30, TFT_BLACK);
-
-  // Display sensor state
   tft.setCursor(10, 120);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.printf("IR: %s", lineDetected ? "WHITE" : "BLACK");
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
-  return lineDetected; // true = white line detected
+  return lineDetected;
 }
-
 
 // ------------------------------------------------------
 void updateDisplay(const char* status, long distance) {
